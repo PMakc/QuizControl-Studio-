@@ -186,3 +186,20 @@ body.media-drawer-open{overflow:hidden}
 .player-fullscreen-video .media-sync-status{position:absolute;left:8px;right:8px;bottom:8px;color:#ffffff80;pointer-events:none}
 .player-fullscreen-video .media-sync-notice{position:absolute;left:10px;right:10px;bottom:28px;z-index:2;background:#24170feF}
 @media(max-width:720px){.media-drawer{width:100vw;padding:18px 14px}.media-drawer .media-library-item{grid-template-columns:100px minmax(0,1fr)}.media-drawer .media-library-actions{grid-template-columns:minmax(0,1fr) auto auto}.media-drawer-trigger{padding:8px 10px;font-size:10px}.media-presentation-top{flex-direction:column}.stage.media-fullscreen-active .stage-content{padding:0}}
+
+
+/* Admin live question timer */
+.admin-question-timer{margin-top:16px;padding:16px 18px;border:1px solid #4a392b;border-radius:15px;background:linear-gradient(110deg,#191714,#171b22);}
+.admin-question-timer-top{display:flex;align-items:center;justify-content:space-between;gap:16px;}
+.admin-question-timer-caption{font-size:12px;color:#b8aaa0;margin-top:3px;font-weight:650;}
+.admin-question-timer-value{font-size:clamp(30px,4vw,42px);line-height:1;font-weight:950;font-variant-numeric:tabular-nums;letter-spacing:1px;color:#ffbd83;min-width:110px;text-align:right;}
+.admin-question-timer-track{height:9px;margin-top:14px;border-radius:99px;background:#332c27;overflow:hidden;}
+.admin-question-timer-fill{height:100%;width:100%;border-radius:99px;background:linear-gradient(90deg,#ff9b4a,#ffca82);transition:width .35s linear,background .2s ease;}
+.admin-question-timer-bottom{display:flex;justify-content:space-between;gap:12px;margin-top:9px;color:#b6a99e;font-size:11px;font-weight:650;}
+.admin-question-timer-bottom span:last-child{font-size:10px;letter-spacing:.8px;color:#897d73;}
+.admin-question-timer.is-urgent .admin-question-timer-value{color:#ff7c72;}
+.admin-question-timer.is-urgent .admin-question-timer-fill{background:linear-gradient(90deg,#e34d43,#ff8174);}
+.admin-question-timer.is-revealed{border-color:#3d6149;}
+.admin-question-timer.is-revealed .admin-question-timer-value{color:#91d9a9;}
+.admin-question-timer.is-revealed .admin-question-timer-fill{background:linear-gradient(90deg,#398b5c,#8bd4a2);}
+@media(max-width:720px){.admin-question-timer{padding:13px}.admin-question-timer-value{font-size:34px}.admin-question-timer-bottom{font-size:10px;}}

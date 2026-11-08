@@ -22,7 +22,7 @@ else:
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2), 'utf-8')
 ADMIN_KEY = config['admin_key']
 
-app = FastAPI(title='QuizControl', version='0.6.4')
+app = FastAPI(title='QuizControl', version='0.6.5')
 app.mount('/static', StaticFiles(directory=STATIC), name='static')
 app.mount('/media', StaticFiles(directory=MEDIA), name='media')
 
@@ -786,4 +786,4 @@ async def connect_qr(request: Request):
 
 @app.on_event('startup')
 async def startup():
-    print('\n'+'='*58+'\n QUIZCONTROL 0.6.4\n Админка: http://127.0.0.1:8080/admin\n Экран: http://127.0.0.1:8080/display\n Участники: http://127.0.0.1:8080/join\n Пароль организатора: '+ADMIN_KEY+'\n'+'='*58+'\n')
+    print('\n'+'='*58+'\n QUIZCONTROL 0.6.5\n Админка: http://127.0.0.1:8080/admin\n Экран: http://127.0.0.1:8080/display\n Участники: http://127.0.0.1:8080/join\n Пароль организатора: '+ADMIN_KEY+'\n'+'='*58+'\n')

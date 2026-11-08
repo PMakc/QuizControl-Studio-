@@ -1,1 +1,1 @@
-QuizControl Studio 0.6.4
+QuizControl Studio 0.6.5
