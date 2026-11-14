@@ -75,7 +75,10 @@
       if (s && control && target && control.action === 'playing' && String(control.scope || 'question') === target.scope && Number(control.question_id) === Number(target.id)) {
         endedSequence = Number(control.sequence);
         setNotice(false);
-        setStatus('Трек завершён · для повтора ведущий может нажать «С начала»');
+        setStatus('Трек завершён · ведущий готовит следующий шаг');
+        if (target.scope === 'screen' && s.screen_media && s.screen_media.url === target.media && ['karaoke','gallery'].includes(s.active_round?.round_type)) {
+          fetch('/api/media-ended', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: target.media, duration: Number(mediaElement.duration || mediaElement.currentTime || 0) }) }).catch(() => {});
+        }
       }
     });
     mediaElement.addEventListener('error', () => {

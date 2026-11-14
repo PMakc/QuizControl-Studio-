@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, RedirectResponse, Response
 from fastapi import Request
-import io, time, socket, unicodedata, math
+import io, time, socket, unicodedata, math, random
 from urllib.parse import urlsplit
 import qrcode
 from fastapi.staticfiles import StaticFiles
@@ -22,7 +22,7 @@ else:
     CONFIG.write_text(json.dumps(config, ensure_ascii=False, indent=2), 'utf-8')
 ADMIN_KEY = config['admin_key']
 
-app = FastAPI(title='QuizControl', version='0.6.5')
+app = FastAPI(title='QuizControl', version='0.7.0')
 app.mount('/static', StaticFiles(directory=STATIC), name='static')
 app.mount('/media', StaticFiles(directory=MEDIA), name='media')
 
@@ -68,9 +68,18 @@ def init_db():
         add_column(c, 'games', 'description', "TEXT NOT NULL DEFAULT ''")
         add_column(c, 'games', 'show_scoreboard', 'INTEGER NOT NULL DEFAULT 1')
         add_column(c, 'games', 'allow_registration', 'INTEGER NOT NULL DEFAULT 1')
+        add_column(c, 'games', 'sound_settings_json', "TEXT NOT NULL DEFAULT '{}'")
         add_column(c, 'rounds', 'allow_answers', 'INTEGER NOT NULL DEFAULT -1') # -1 inherits game setting
         add_column(c, 'rounds', 'round_type', "TEXT NOT NULL DEFAULT 'standard'")
         add_column(c, 'rounds', 'instructions', "TEXT NOT NULL DEFAULT ''")
+        add_column(c, 'rounds', 'media_items_json', "TEXT NOT NULL DEFAULT '[]'")
+        add_column(c, 'rounds', 'gallery_interval', 'INTEGER NOT NULL DEFAULT 0')
+        add_column(c, 'rounds', 'gallery_video_auto', 'INTEGER NOT NULL DEFAULT 1')
+        add_column(c, 'rounds', 'karaoke_singers', 'INTEGER NOT NULL DEFAULT 1')
+        add_column(c, 'rounds', 'karaoke_auto_next', 'INTEGER NOT NULL DEFAULT 1')
+        add_column(c, 'rounds', 'karaoke_next_delay', 'INTEGER NOT NULL DEFAULT 5')
+        add_column(c, 'rounds', 'sound_settings_json', "TEXT NOT NULL DEFAULT '{}'")
+        c.execute("CREATE TABLE IF NOT EXISTS media_metadata (filename TEXT PRIMARY KEY, display_name TEXT NOT NULL DEFAULT '', original_name TEXT NOT NULL DEFAULT '')")
         add_column(c, 'questions', 'question_type', "TEXT NOT NULL DEFAULT 'text'")
         add_column(c, 'questions', 'options_json', "TEXT NOT NULL DEFAULT '[]'")
         add_column(c, 'questions', 'correct_answer', "TEXT NOT NULL DEFAULT ''")
@@ -91,9 +100,18 @@ def init_db():
         c.execute('UPDATE participants SET game_id=? WHERE game_id=0', (first_game,))
         if c.execute("SELECT value FROM settings WHERE key='current_game'").fetchone() is None:
             c.execute("INSERT INTO settings(key,value) VALUES('current_game',?)",(str(first_game),))
-        for key, value in [('current_question','0'),('screen_mode','welcome'),('question_started_at','0'),('answers_revealed','0'),('timer_frozen_remaining',''),('active_round_id','0'),('public_url',''),('media_control','{}'),('screen_media','{}'),('screen_mode_before_media','')]:
+        for key, value in [('current_question','0'),('screen_mode','welcome'),('question_started_at','0'),('answers_revealed','0'),('timer_frozen_remaining',''),('active_round_id','0'),('public_url',''),('media_control','{}'),('screen_media','{}'),('screen_mode_before_media',''),('karaoke_state','{}'),('sound_event','{}'),('wheel_state','{}')]:
             if c.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone() is None:
                 c.execute('INSERT INTO settings(key,value) VALUES(?,?)',(key,value))
+        if c.execute("SELECT value FROM settings WHERE key='round_sound_migration_v068'").fetchone() is None:
+            legacy_rows=c.execute("SELECT r.id,g.sound_settings_json FROM rounds r JOIN games g ON g.id=r.game_id WHERE r.sound_settings_json='{}' AND g.sound_settings_json!='{}'").fetchall()
+            for legacy in legacy_rows:
+                try: legacy_sounds=json.loads(legacy['sound_settings_json'] or '{}')
+                except (TypeError,ValueError): legacy_sounds={}
+                if 'timer_loop' not in legacy_sounds and legacy_sounds.get('timer_tick'):
+                    legacy_sounds['timer_loop']=legacy_sounds['timer_tick']
+                c.execute('UPDATE rounds SET sound_settings_json=? WHERE id=?',(json.dumps(legacy_sounds,ensure_ascii=False),legacy['id']))
+            c.execute("INSERT INTO settings(key,value) VALUES('round_sound_migration_v068','1')")
 
 init_db()
 
@@ -138,6 +156,83 @@ def freeze_question_timer(c, question_id):
     remaining=max(0, math.ceil(limit-(time.time()-started))) if limit>0 and started else 0
     c.execute("UPDATE settings SET value=? WHERE key='timer_frozen_remaining'",(str(remaining),))
     return remaining
+
+def read_json_setting(c, key, default=None):
+    row=c.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
+    try: value=json.loads(row['value'] or '') if row else default
+    except (TypeError,ValueError): value=default
+    return value if isinstance(value,dict) else (default if default is not None else {})
+
+
+def write_json_setting(c, key, value):
+    c.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,json.dumps(value,ensure_ascii=False)))
+
+
+def emit_sound_event(c, event_type):
+    old=read_json_setting(c,'sound_event',{})
+    write_json_setting(c,'sound_event',{'sequence':int(old.get('sequence') or 0)+1,'type':str(event_type),'at':time.time()})
+
+
+def get_karaoke_state(c):
+    return read_json_setting(c,'karaoke_state',{})
+
+
+def complete_media_round(c, rid):
+    c.execute("UPDATE round_progress SET status='completed',finished_at=? WHERE round_id=? AND status='in_progress'",(time.time(),rid))
+    clear_screen_media(c)
+    stop_media_control(c)
+    c.execute("UPDATE settings SET value='0' WHERE key='current_question'")
+    c.execute("UPDATE settings SET value='0' WHERE key='question_started_at'")
+    c.execute("UPDATE settings SET value='1' WHERE key='answers_revealed'")
+    c.execute("UPDATE settings SET value='0' WHERE key='timer_frozen_remaining'")
+    c.execute("UPDATE settings SET value='round_summary' WHERE key='screen_mode'")
+    emit_sound_event(c,'round_summary')
+
+
+def advance_media_automation(c):
+    mode_row=c.execute("SELECT value FROM settings WHERE key='screen_mode'").fetchone()
+    if not mode_row or mode_row['value']!='media_fullscreen': return
+    media=get_screen_media(c)
+    if not media: return
+    now=time.time(); rid=int(media.get('round_id') or 0)
+    round_row=c.execute('SELECT * FROM rounds WHERE id=?',(rid,)).fetchone() if rid else None
+    if not round_row: return
+    if round_row['round_type']=='gallery' and media.get('auto_advance_at') and now>=float(media['auto_advance_at']):
+        step_round_media(c,1,automatic=True)
+        return
+    if round_row['round_type']!='karaoke': return
+    kstate=get_karaoke_state(c)
+    if int(kstate.get('round_id') or 0)!=rid: return
+    if kstate.get('status')=='counting' and now-float(kstate.get('started_at') or now)>=2.8:
+        ids=[int(x) for x in kstate.get('singer_ids',[])][:int(round_row['karaoke_singers'] or 1)]
+        people=[]
+        for pid in ids:
+            person=c.execute('SELECT id,name,group_name FROM participants WHERE id=? AND game_id=?',(pid,current_game_id(c))).fetchone()
+            if person: people.append(dict(person))
+        if len(people)==int(round_row['karaoke_singers'] or 1):
+            results=[]
+            for person in people:
+                points=random.randint(65,100)
+                c.execute('INSERT INTO scores(participant_id,points,reason,round_id) VALUES(?,?,?,?)',(person['id'],points,'Караоке: '+str(media.get('name') or 'выступление'),rid))
+                results.append({'participant_id':person['id'],'name':person['name'],'group_name':person['group_name'],'points':points})
+            high=max(x['points'] for x in results)
+            winners=[x['name'] for x in results if x['points']==high]
+            kstate.update({'status':'result_intro','results':results,'winner_names':winners,'started_at':now,'next_at':0})
+            write_json_setting(c,'karaoke_state',kstate)
+            emit_sound_event(c,'karaoke_results_open')
+    elif kstate.get('status')=='result_intro' and now-float(kstate.get('started_at') or now)>=1.5:
+        kstate.update({'status':'result','started_at':now,'next_at':now+max(1,int(round_row['karaoke_next_delay'] or 5)) if int(round_row['karaoke_auto_next'] or 0) else 0})
+        write_json_setting(c,'karaoke_state',kstate)
+        emit_sound_event(c,'karaoke_points_show')
+    elif kstate.get('status')=='result' and int(round_row['karaoke_auto_next'] or 0) and float(kstate.get('next_at') or 0)>0 and now>=float(kstate['next_at']):
+        items=media.get('items') or []; index=int(media.get('index') or 0)
+        if index+1<len(items):
+            item=items[index+1]
+            show_screen_media(c,{'url':item.get('url'),'name':item.get('name'),'items':items,'index':index+1,'round_id':rid,'round_type':'karaoke','karaoke_singers':int(round_row['karaoke_singers'] or 1),'auto_interval':0})
+            write_json_setting(c,'karaoke_state',{'round_id':rid,'index':index+1,'status':'playing','singer_ids':kstate.get('singer_ids',[]),'results':[],'winner_names':[]})
+        else:
+            complete_media_round(c,rid)
+
 
 def get_screen_media(c):
     row=c.execute("SELECT value FROM settings WHERE key='screen_media'").fetchone()
@@ -217,12 +312,39 @@ def show_screen_media(c, data):
     current_mode=c.execute("SELECT value FROM settings WHERE key='screen_mode'").fetchone()['value']
     if current_mode!='media_fullscreen':
         c.execute("UPDATE settings SET value=? WHERE key='screen_mode_before_media'",(current_mode,))
-    value={'url':url,'type':media_type,'name':str(data.get('name') or name)}
+    meta=c.execute('SELECT display_name FROM media_metadata WHERE filename=?',(name,)).fetchone()
+    display_name=(meta['display_name'] if meta and meta['display_name'] else str(data.get('name') or name))
+    value={'url':url,'type':media_type,'name':display_name}
+    if isinstance(data.get('items'),list):
+        interval=max(0,min(3600,int(data.get('auto_interval') or 0)))
+        value['items']=data['items']; value['index']=int(data.get('index') or 0); value['round_id']=int(data.get('round_id') or 0)
+        value['round_type']=str(data.get('round_type') or '')
+        value['auto_interval']=interval
+        value['auto_video_advance']=1 if int(data.get('auto_video_advance',1)) else 0
+        value['auto_advance_at']=now+interval if interval>0 and media_type=='image' else 0
+        value['karaoke_singers']=int(data.get('karaoke_singers') or 1)
     c.execute("UPDATE settings SET value=? WHERE key='screen_media'",(json.dumps(value,ensure_ascii=False),))
     c.execute("UPDATE settings SET value='media_fullscreen' WHERE key='screen_mode'")
     control={'sequence':old['sequence']+1,'scope':'screen','question_id':0,'url':url,'type':media_type,'action':'playing' if media_type=='video' else 'stopped','position':0.0,'updated_at':now}
     write_media_control(c,control)
     return value
+
+
+def step_round_media(c, direction, automatic=False):
+    target=get_screen_media(c)
+    if not target or not isinstance(target.get('items'),list) or not target['items']:
+        if automatic: return None
+        raise HTTPException(400,'Сейчас не запущен медиараунд')
+    items=target['items']; index=int(target.get('index') or 0)
+    new_index=index+int(direction)
+    if new_index<0: new_index=0
+    if new_index>=len(items):
+        if automatic:
+            complete_media_round(c,int(target.get('round_id') or 0))
+            return None
+        return target
+    item=items[new_index]
+    return show_screen_media(c,{'url':item.get('url'),'name':item.get('name'),'items':items,'index':new_index,'round_id':target.get('round_id',0),'round_type':target.get('round_type',''),'auto_interval':target.get('auto_interval',0),'auto_video_advance':target.get('auto_video_advance',1),'karaoke_singers':target.get('karaoke_singers',1)})
 
 
 def hide_screen_media(c):
@@ -254,6 +376,7 @@ def stop_media_control(c):
 
 def state(include_private=False):
     with db() as c:
+        advance_media_automation(c)
         settings = {r['key']:r['value'] for r in c.execute('SELECT * FROM settings')}
         media_control=get_media_control(c)
         screen_media=get_screen_media(c)
@@ -262,11 +385,21 @@ def state(include_private=False):
         if not game:
             game = c.execute('SELECT * FROM games ORDER BY id DESC LIMIT 1').fetchone()
             gid = game['id'] if game else 0
+        game_data=dict(game) if game else None
+        if game_data:
+            try: game_data['sound_settings']=json.loads(game_data.get('sound_settings_json') or '{}')
+            except (TypeError,ValueError): game_data['sound_settings']={}
         active_round_id = int(settings.get('active_round_id','0') or 0)
         rounds=[]; current_q=None; active_round=None
         if game:
             for r0 in c.execute('SELECT * FROM rounds WHERE game_id=? ORDER BY position,id',(gid,)):
                 r=dict(r0)
+                if not include_private and r.get('round_type')=='wheel':
+                    r['title']='Поле чудес'
+                try: r['media_items']=json.loads(r.get('media_items_json') or '[]')
+                except: r['media_items']=[]
+                try: r['sound_settings']=json.loads(r.get('sound_settings_json') or '{}')
+                except: r['sound_settings']={}
                 r['allow_answers_effective'] = bool(game['allow_answers']) if r['allow_answers'] == -1 else bool(r['allow_answers'])
                 progress=c.execute('SELECT status,started_at,finished_at FROM round_progress WHERE game_id=? AND round_id=?',(gid,r['id'])).fetchone()
                 r['progress_status']=progress['status'] if progress else 'pending'
@@ -281,8 +414,10 @@ def state(include_private=False):
                 r['questions']=qs
                 if r['id']==active_round_id: active_round=r
                 rounds.append(r)
-            qid=int(settings.get('current_question','0'))
-            if qid:
+            if game_data and active_round is not None:
+                game_data['sound_settings']=active_round.get('sound_settings') or {}
+        qid=int(settings.get('current_question','0'))
+        if qid:
                 q=c.execute('SELECT q.*,r.title round_title,r.allow_answers round_allow_answers,g.allow_answers game_allow_answers FROM questions q JOIN rounds r ON q.round_id=r.id JOIN games g ON r.game_id=g.id WHERE q.id=?',(qid,)).fetchone()
                 if q:
                     current_q=dict(q)
@@ -311,6 +446,7 @@ def state(include_private=False):
                         c.execute("UPDATE settings SET value='0' WHERE key='timer_frozen_remaining'")
                         settings['timer_frozen_remaining']='0'
                         finalize_question(c,current_q['id'])
+                        emit_sound_event(c,'answer_reveal')
             raw_answers=[x['text'] for x in c.execute('SELECT a.text FROM answers a WHERE a.question_id=? AND a.id=(SELECT MAX(b.id) FROM answers b WHERE b.question_id=a.question_id AND b.participant_id=a.participant_id)',(current_q['id'],)).fetchall()]
             answer_count=len(raw_answers)
             if current_q.get('question_type') in ('single_choice','true_false','multiple_choice'):
@@ -325,6 +461,16 @@ def state(include_private=False):
                 counts={}
                 for raw in raw_answers: counts[raw]=counts.get(raw,0)+1
                 answer_stats=[{'text':value,'count':count,'percent':round(count*100/answer_count) if answer_count else 0} for value,count in sorted(counts.items(),key=lambda x:(-x[1],x[0]))]
+        admin_submissions=[]
+        if current_q and include_private:
+            admin_submissions=[dict(x) for x in c.execute('''
+                SELECT a.id,a.text,a.created_at,a.is_correct,a.awarded_points,
+                       p.id participant_id,p.name,p.group_name
+                FROM answers a JOIN participants p ON p.id=a.participant_id
+                WHERE a.question_id=? AND a.id=(
+                    SELECT MAX(b.id) FROM answers b WHERE b.question_id=a.question_id AND b.participant_id=a.participant_id
+                ) ORDER BY a.id DESC
+            ''',(current_q['id'],))]
         if current_q and not include_private and not revealed:
             current_q['correct_answer']=''; current_q['explanation']=''
         round_points={}
@@ -355,9 +501,32 @@ def state(include_private=False):
             }
         reaction_events=[dict(x) for x in c.execute('SELECT r.id,r.emoji,p.name FROM reactions r JOIN participants p ON p.id=r.participant_id WHERE r.game_id=? AND r.created_at>? ORDER BY r.id',(gid,time.time()-12))]
         reaction_counts=[dict(x) for x in c.execute('SELECT emoji,COUNT(*) count FROM reactions WHERE game_id=? GROUP BY emoji ORDER BY count DESC',(gid,))]
+        karaoke_state=read_json_setting(c,'karaoke_state',{})
+        wheel_state=read_json_setting(c,'wheel_state',{})
+        if wheel_state and int(wheel_state.get('round_id') or 0)==active_round_id:
+            # Keep the turn order fixed, but attach live round and overall scores for every team.
+            score_by_name={str(x.get('name') or ''):x for x in scoreboard}
+            live_teams=[]
+            for team in wheel_state.get('teams',[]):
+                score_row=score_by_name.get(str(team.get('name') or ''),{})
+                live_teams.append({**team,'score':int(score_row.get('score') or 0),'round_score':int(score_row.get('round_score') or 0)})
+            wheel_state['teams']=live_teams
+            wheel_state['team_count']=len(live_teams)
+            wheel_state['total_points']=sum(x['score'] for x in live_teams)
+            wheel_state['round_points_total']=sum(x['round_score'] for x in live_teams)
+            if not include_private and wheel_state.get('spinning'):
+                wheel_state['spin_value']=None
+        if not include_private:
+            # The wheel word is stored as the round title, so never send it to players.
+            wheel_state.pop('word',None)
+            if wheel_state.get('spinning'):
+                wheel_state.pop('spin_target_index',None)
+        sound_event=read_json_setting(c,'sound_event',{})
         return {
-            'game':dict(game) if game else None,'rounds':rounds,'participants':people,'scoreboard':scoreboard,
+            'game':game_data,'rounds':rounds,'participants':people,'scoreboard':scoreboard,
+            'karaoke_state':karaoke_state,'wheel_state':wheel_state,'sound_event':sound_event,
             'current_question':current_q,'active_round':active_round,'active_round_id':active_round_id,
+            'admin_submissions':admin_submissions if include_private else [],
             'screen_mode':settings.get('screen_mode','welcome'),
             'allow_answers':current_q['allow_answers_effective'] if current_q else (active_round['allow_answers_effective'] if active_round else (bool(game['allow_answers']) if game else False)),
             'format':game['format'] if game else 'team','status':game['status'] if game else 'draft',
@@ -442,12 +611,17 @@ async def action(p:Payload,x_admin_key:str|None=Header(default=None)):
             if not c.execute('SELECT id FROM games WHERE id=?',(target,)).fetchone(): raise HTTPException(404,'Игра не найдена')
             gid=target; c.execute("UPDATE settings SET value=? WHERE key='current_game'",(str(gid),)); c.execute("UPDATE settings SET value='0' WHERE key='current_question'"); c.execute("UPDATE settings SET value='0' WHERE key='answers_revealed'"); c.execute("UPDATE settings SET value='0' WHERE key='question_started_at'"); c.execute("UPDATE settings SET value='welcome' WHERE key='screen_mode'"); c.execute("UPDATE settings SET value='0' WHERE key='active_round_id'")
         elif a=='update_game':
-            c.execute('UPDATE games SET title=?,format=?,allow_answers=?,game_type=?,description=?,show_scoreboard=?,allow_registration=? WHERE id=?',(d['title'],d.get('format','team'),int(bool(d.get('allow_answers'))),d.get('game_type','mixed'),d.get('description',''),int(d.get('show_scoreboard',1)),int(d.get('allow_registration',1)),int(d['game_id'])))
+            old_game=c.execute('SELECT sound_settings_json FROM games WHERE id=?',(int(d['game_id']),)).fetchone()
+            old_sounds={}
+            try: old_sounds=json.loads(old_game['sound_settings_json'] or '{}') if old_game else {}
+            except (TypeError,ValueError): old_sounds={}
+            game_sounds=d.get('sound_settings',old_sounds)
+            c.execute('UPDATE games SET title=?,format=?,allow_answers=?,game_type=?,description=?,show_scoreboard=?,allow_registration=?,sound_settings_json=? WHERE id=?',(d['title'],d.get('format','team'),int(bool(d.get('allow_answers'))),d.get('game_type','mixed'),d.get('description',''),int(d.get('show_scoreboard',1)),int(d.get('allow_registration',1)),json.dumps(game_sounds,ensure_ascii=False),int(d['game_id'])))
         elif a=='add_round':
             pos=c.execute('SELECT COALESCE(MAX(position),0)+1 p FROM rounds WHERE game_id=?',(gid,)).fetchone()['p']
-            c.execute('INSERT INTO rounds(game_id,title,position,allow_answers,round_type,instructions) VALUES(?,?,?,?,?,?)',(gid,d.get('title') or f'Раунд {pos}',pos,int(d.get('allow_answers',-1)),d.get('round_type','standard'),d.get('instructions','')))
+            c.execute('INSERT INTO rounds(game_id,title,position,allow_answers,round_type,instructions,media_items_json,gallery_interval,gallery_video_auto,karaoke_singers,karaoke_auto_next,karaoke_next_delay,sound_settings_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(gid,d.get('title') or f'Раунд {pos}',pos,int(d.get('allow_answers',-1)),d.get('round_type','standard'),d.get('instructions',''),json.dumps(d.get('media_items',[]),ensure_ascii=False),max(0,min(3600,int(d.get('gallery_interval') or 0))),int(bool(d.get('gallery_video_auto',1))),1 if int(d.get('karaoke_singers') or 1)==1 else 2,int(bool(d.get('karaoke_auto_next',1))),max(1,min(60,int(d.get('karaoke_next_delay') or 5))),json.dumps(d.get('sound_settings',{}),ensure_ascii=False)))
         elif a=='update_round':
-            c.execute('UPDATE rounds SET title=?,allow_answers=?,round_type=?,instructions=? WHERE id=?',(d['title'],int(d.get('allow_answers',-1)),d.get('round_type','standard'),d.get('instructions',''),int(d['round_id'])))
+            c.execute('UPDATE rounds SET title=?,allow_answers=?,round_type=?,instructions=?,media_items_json=?,gallery_interval=?,gallery_video_auto=?,karaoke_singers=?,karaoke_auto_next=?,karaoke_next_delay=?,sound_settings_json=? WHERE id=?',(d['title'],int(d.get('allow_answers',-1)),d.get('round_type','standard'),d.get('instructions',''),json.dumps(d.get('media_items',[]),ensure_ascii=False),max(0,min(3600,int(d.get('gallery_interval') or 0))),int(bool(d.get('gallery_video_auto',1))),1 if int(d.get('karaoke_singers') or 1)==1 else 2,int(bool(d.get('karaoke_auto_next',1))),max(1,min(60,int(d.get('karaoke_next_delay') or 5))),json.dumps(d.get('sound_settings',{}),ensure_ascii=False),int(d['round_id'])))
         elif a=='move_round':
             rid=int(d['round_id']); direction=int(d.get('direction',0)); row=c.execute('SELECT id,game_id,position FROM rounds WHERE id=?',(rid,)).fetchone()
             if row:
@@ -504,34 +678,76 @@ async def action(p:Payload,x_admin_key:str|None=Header(default=None)):
             c.execute("UPDATE settings SET value='welcome' WHERE key='screen_mode'")
             c.execute("UPDATE games SET status='draft' WHERE id=?",(gid,))
         elif a=='start_round':
-            clear_screen_media(c)
             rid=int(d.get('round_id') or 0)
             round_row=c.execute('SELECT * FROM rounds WHERE id=? AND game_id=?',(rid,gid)).fetchone()
             if not round_row: raise HTTPException(404,'Раунд не найден в текущей игре')
-            first=c.execute('SELECT id FROM questions WHERE round_id=? ORDER BY position,id LIMIT 1',(rid,)).fetchone()
-            if not first: raise HTTPException(400,'В этом раунде пока нет вопросов')
+            try: media_items=json.loads(round_row['media_items_json'] or '[]')
+            except: media_items=[]
+            media_round=round_row['round_type'] in ('karaoke','gallery')
+            wheel_round=round_row['round_type']=='wheel'
+            mic_round=round_row['round_type']=='mic'
+            if media_round:
+                allowed_types={'video'} if round_row['round_type']=='karaoke' else {'video','image'}
+                media_items=[x for x in media_items if isinstance(x,dict) and x.get('type') in allowed_types and str(x.get('url','')).startswith('/media/') and (MEDIA/Path(str(x.get('url','')).split('/')[-1])).is_file()]
+                if not media_items: raise HTTPException(400,'Добавьте в настройки раунда подходящие файлы из медиатеки')
+                first=None
+            elif mic_round or wheel_round:
+                first=None
+            else:
+                first=c.execute('SELECT id FROM questions WHERE round_id=? ORDER BY position,id LIMIT 1',(rid,)).fetchone()
+                if not first: raise HTTPException(400,'В этом раунде пока нет вопросов')
             progress=c.execute('SELECT status FROM round_progress WHERE game_id=? AND round_id=?',(gid,rid)).fetchone()
             progress_status=progress['status'] if progress else 'pending'
             active_id=int(c.execute("SELECT value FROM settings WHERE key='active_round_id'").fetchone()['value'] or 0)
             if progress_status=='completed': raise HTTPException(409,'Этот раунд уже завершён. Для повторной игры создайте его копию.')
             if progress_status=='in_progress':
                 if active_id!=rid: raise HTTPException(409,'Сначала завершите текущий активный раунд.')
-                current=int(c.execute("SELECT value FROM settings WHERE key='current_question'").fetchone()['value'] or 0)
-                current_valid=c.execute('SELECT id FROM questions WHERE id=? AND round_id=?',(current,rid)).fetchone()
-                if not current_valid: raise HTTPException(409,'Не удалось восстановить текущий вопрос этого раунда.')
-                c.execute("UPDATE settings SET value='question' WHERE key='screen_mode'")
+                if media_round:
+                    current_media=get_screen_media(c)
+                    if not current_media or int(current_media.get('round_id') or 0)!=rid:
+                        show_screen_media(c,{'url':media_items[0]['url'],'name':media_items[0].get('name'),'items':media_items,'index':0,'round_id':rid,'round_type':round_row['round_type'],'auto_interval':round_row['gallery_interval'],'auto_video_advance':round_row['gallery_video_auto'],'karaoke_singers':round_row['karaoke_singers']})
+                    else:
+                        c.execute("UPDATE settings SET value='media_fullscreen' WHERE key='screen_mode'")
+                elif mic_round:
+                    c.execute("UPDATE settings SET value='audio_visualizer' WHERE key='screen_mode'")
+                elif wheel_round:
+                    c.execute("UPDATE settings SET value='0' WHERE key='current_question'")
+                else:
+                    current=int(c.execute("SELECT value FROM settings WHERE key='current_question'").fetchone()['value'] or 0)
+                    current_valid=c.execute('SELECT id FROM questions WHERE id=? AND round_id=?',(current,rid)).fetchone()
+                    if not current_valid: raise HTTPException(409,'Не удалось восстановить текущий вопрос этого раунда.')
+                    c.execute("UPDATE settings SET value='question' WHERE key='screen_mode'")
             else:
+                clear_screen_media(c)
                 stop_media_control(c)
                 other=c.execute("SELECT round_id FROM round_progress WHERE game_id=? AND status='in_progress' LIMIT 1",(gid,)).fetchone()
                 if other: raise HTTPException(409,'Сначала завершите текущий раунд через блок управления на вкладке «Обзор».')
                 now=time.time()
                 c.execute('INSERT INTO round_progress(game_id,round_id,status,started_at,finished_at) VALUES(?,?,?,?,NULL) ON CONFLICT(game_id,round_id) DO UPDATE SET status=excluded.status,started_at=excluded.started_at,finished_at=NULL',(gid,rid,'in_progress',now))
                 c.execute("UPDATE settings SET value=? WHERE key='active_round_id'",(str(rid),))
-                c.execute("UPDATE settings SET value=? WHERE key='current_question'",(str(first['id']),))
-                c.execute("UPDATE settings SET value='question' WHERE key='screen_mode'")
-                c.execute("UPDATE settings SET value=? WHERE key='question_started_at'",(str(now),))
-                c.execute("UPDATE settings SET value='0' WHERE key='answers_revealed'")
-                c.execute("UPDATE settings SET value='' WHERE key='timer_frozen_remaining'")
+                if media_round:
+                    c.execute("UPDATE settings SET value='0' WHERE key='current_question'")
+                    show_screen_media(c,{'url':media_items[0]['url'],'name':media_items[0].get('name'),'items':media_items,'index':0,'round_id':rid,'round_type':round_row['round_type'],'auto_interval':round_row['gallery_interval'],'auto_video_advance':round_row['gallery_video_auto'],'karaoke_singers':round_row['karaoke_singers']})
+                    if round_row['round_type']=='karaoke': write_json_setting(c,'karaoke_state',{'round_id':rid,'index':0,'status':'playing','singer_ids':[],'results':[],'winner_names':[]})
+                elif mic_round:
+                    c.execute("UPDATE settings SET value='0' WHERE key='current_question'")
+                    c.execute("UPDATE settings SET value='audio_visualizer' WHERE key='screen_mode'")
+                elif wheel_round:
+                    c.execute("UPDATE settings SET value='0' WHERE key='current_question'")
+                    teams=[]
+                    for person in c.execute('SELECT id,name,group_name FROM participants WHERE game_id=? ORDER BY id',(gid,)):
+                        label=(person['group_name'] or '').strip() or person['name']
+                        if not any(t['name']==label for t in teams): teams.append({'id':person['id'],'name':label})
+                    try: sectors=[int(x.strip()) if x.strip().isdigit() else x.strip().upper() for x in (round_row['instructions'] or '100,200,300,400,500,600,700,800,900,1000').split(',') if x.strip()]
+                    except: sectors=[100,200,300,400,500,600,700,800,900,1000]
+                    word=(round_row['title'] or '').strip().upper().replace('Ё','Е')
+                    write_json_setting(c,'wheel_state',{'round_id':rid,'word':word,'mask':['_' if ch.isalpha() else ch for ch in word],'opened':[],'teams':teams,'team_index':0,'sector_values':sectors,'spin_value':None,'last_spin_value':None,'spin_target_index':None,'spin_id':0,'spin_started_at':0,'spinning':False,'history':[],'last_awarded_points':0,'status':'ready'})
+                else:
+                    c.execute("UPDATE settings SET value=? WHERE key='current_question'",(str(first['id']),))
+                    c.execute("UPDATE settings SET value='question' WHERE key='screen_mode'")
+                    c.execute("UPDATE settings SET value=? WHERE key='question_started_at'",(str(now),))
+                    c.execute("UPDATE settings SET value='0' WHERE key='answers_revealed'")
+                    c.execute("UPDATE settings SET value='' WHERE key='timer_frozen_remaining'")
             c.execute("UPDATE games SET status='active' WHERE id=?",(gid,))
         elif a=='set_question':
             clear_screen_media(c)
@@ -566,24 +782,111 @@ async def action(p:Payload,x_admin_key:str|None=Header(default=None)):
                 stop_media_control(c)
                 c.execute("UPDATE round_progress SET status='completed',finished_at=? WHERE game_id=? AND round_id=?",(time.time(),gid,rid))
                 c.execute("UPDATE settings SET value='0' WHERE key='current_question'"); c.execute("UPDATE settings SET value='0' WHERE key='question_started_at'"); c.execute("UPDATE settings SET value='1' WHERE key='answers_revealed'"); c.execute("UPDATE settings SET value='0' WHERE key='timer_frozen_remaining'"); c.execute("UPDATE settings SET value='round_summary' WHERE key='screen_mode'")
+                emit_sound_event(c,'round_summary')
+        elif a=='wheel_spin':
+            rid=int(c.execute("SELECT value FROM settings WHERE key='active_round_id'").fetchone()['value'] or 0)
+            rr=c.execute("SELECT * FROM rounds WHERE id=? AND round_type='wheel' AND game_id=?",(rid,gid)).fetchone()
+            if not rr: raise HTTPException(409,'Активный раунд не является «Полем чудес».')
+            try:
+                sectors=[int(x.strip()) if x.strip().lstrip('-').isdigit() else x.strip().upper() for x in (rr['instructions'] or '100,200,300,400,500,600,700,800,900,1000').split(',') if x.strip()]
+            except (TypeError,ValueError):
+                sectors=[100,200,300,400,500,600,700,800,900,1000]
+            if not sectors: sectors=[100,200,300,400,500,600,700,800,900,1000]
+            w=read_json_setting(c,'wheel_state',{})
+            if w.get('spinning'): raise HTTPException(409,'Барабан уже вращается.')
+            if w.get('status')=='solved': raise HTTPException(409,'Слово уже отгадано. Завершите или сбросьте раунд.')
+            if not w.get('teams'): raise HTTPException(400,'Сначала зарегистрируйте хотя бы одну команду/участника.')
+            spin_index=random.randrange(len(sectors))
+            w.update({'spin_value':sectors[spin_index],'last_spin_value':w.get('last_spin_value'),'spin_target_index':spin_index,'spin_id':int(w.get('spin_id') or 0)+1,'spin_started_at':time.time(),'spinning':True,'status':'spinning','last_awarded_points':0})
+            write_json_setting(c,'wheel_state',w)
+        elif a=='wheel_stop':
+            w=read_json_setting(c,'wheel_state',{})
+            if not w.get('spinning'): raise HTTPException(409,'Барабан сейчас не вращается.')
+            w['spinning']=False;w['status']='stopped';w['stopped_at']=time.time()
+            write_json_setting(c,'wheel_state',w)
+        elif a=='wheel_letter':
+            rid=int(c.execute("SELECT value FROM settings WHERE key='active_round_id'").fetchone()['value'] or 0)
+            letter=str(d.get('letter','')).strip().upper().replace('Ё','Е')
+            if len(letter)!=1 or not letter.isalpha(): raise HTTPException(400,'Выберите одну букву.')
+            w=read_json_setting(c,'wheel_state',{});word=str(w.get('word') or '')
+            if not rid or int(w.get('round_id') or 0)!=rid: raise HTTPException(409,'Активный раунд «Поле чудес» не найден.')
+            if w.get('spinning') or w.get('spin_value') is None: raise HTTPException(409,'Сначала остановите барабан.')
+            if w.get('status')=='solved': raise HTTPException(409,'Слово уже отгадано.')
+            if letter in w.get('opened',[]): raise HTTPException(409,'Эта буква уже открыта.')
+            teams=w.get('teams') or []
+            if not teams: raise HTTPException(409,'В раунде нет зарегистрированных команд.')
+            team_index=int(w.get('team_index',0))%len(teams);team=teams[team_index]
+            sector_value=w.get('spin_value')
+            occurrences=sum(1 for ch in word if ch==letter)
+            found=occurrences>0
+            awarded=0
+            w.setdefault('opened',[]).append(letter)
+            w['mask']=[ch if (not ch.isalpha() or ch in w['opened']) else '_' for ch in word]
+            if found:
+                try: value_points=int(sector_value)
+                except (TypeError,ValueError): value_points=0
+                awarded=max(0,value_points)*occurrences
+                if awarded and team.get('id'):
+                    c.execute('INSERT INTO scores(participant_id,points,reason,round_id) VALUES(?,?,?,?)',(int(team['id']),awarded,f'Поле чудес: буква {letter} × {occurrences} по {value_points}',rid))
+                w['last_awarded_points']=awarded
+            else:
+                w['last_awarded_points']=0
+            w.setdefault('history',[]).append({'letter':letter,'found':found,'team':team.get('name',''),'points':awarded,'sector':sector_value})
+            solved='_' not in w['mask']
+            w['last_spin_value']=sector_value
+            w['spin_value']=None
+            w['spinning']=False
+            if solved:
+                w['status']='solved'
+                emit_sound_event(c,'wheel_solved')
+            elif found:
+                w['status']='ready'
+                emit_sound_event(c,'wheel_correct')
+            else:
+                w['status']='ready'
+                w['team_index']=(team_index+1)%len(teams)
+                emit_sound_event(c,'wheel_wrong')
+            write_json_setting(c,'wheel_state',w)
+        elif a=='wheel_next_team':
+            w=read_json_setting(c,'wheel_state',{});teams=w.get('teams') or []
+            if teams: w['team_index']=(int(w.get('team_index',0))+1)%len(teams)
+            w['spin_value']=None;w['spinning']=False;w['status']='ready';w['last_awarded_points']=0
+            write_json_setting(c,'wheel_state',w)
+        elif a=='wheel_reveal':
+            w=read_json_setting(c,'wheel_state',{});w['opened']=[ch for ch in w.get('word','') if ch.isalpha()];w['mask']=list(w.get('word',''));w['status']='solved';w['spinning']=False;w['spin_value']=None;w['last_awarded_points']=0
+            emit_sound_event(c,'wheel_solved')
+            write_json_setting(c,'wheel_state',w)
+        elif a=='wheel_reset':
+            w=read_json_setting(c,'wheel_state',{});word=w.get('word','');w.update({'mask':['_' if ch.isalpha() else ch for ch in word],'opened':[],'team_index':0,'spin_value':None,'last_spin_value':None,'spin_target_index':None,'spinning':False,'history':[],'last_awarded_points':0,'status':'ready'})
+            write_json_setting(c,'wheel_state',w)
         elif a=='finish_round':
             clear_screen_media(c)
             stop_media_control(c)
             rid=int(c.execute("SELECT value FROM settings WHERE key='active_round_id'").fetchone()['value'] or 0)
             if not rid: raise HTTPException(400,'Нет активного раунда')
+            round_kind=c.execute('SELECT round_type FROM rounds WHERE id=? AND game_id=?',(rid,gid)).fetchone()
+            if round_kind and round_kind['round_type']=='wheel':
+                wheel=read_json_setting(c,'wheel_state',{})
+                wheel['spinning']=False
+                wheel['spin_value']=None
+                if wheel.get('status')=='spinning': wheel['status']='ready'
+                write_json_setting(c,'wheel_state',wheel)
             progress=c.execute('SELECT status FROM round_progress WHERE game_id=? AND round_id=?',(gid,rid)).fetchone()
             if not progress or progress['status']!='in_progress': raise HTTPException(409,'Активный раунд не найден')
             qid=int(c.execute("SELECT value FROM settings WHERE key='current_question'").fetchone()['value'] or 0)
             if qid:
                 finalize_question(c,qid)
             c.execute("UPDATE round_progress SET status='completed',finished_at=? WHERE game_id=? AND round_id=?",(time.time(),gid,rid))
+            emit_sound_event(c,'round_summary')
             c.execute("UPDATE settings SET value='0' WHERE key='current_question'"); c.execute("UPDATE settings SET value='0' WHERE key='question_started_at'"); c.execute("UPDATE settings SET value='1' WHERE key='answers_revealed'"); c.execute("UPDATE settings SET value='0' WHERE key='timer_frozen_remaining'"); c.execute("UPDATE settings SET value='round_summary' WHERE key='screen_mode'")
         elif a=='reveal_answers':
+            was_revealed=c.execute("SELECT value FROM settings WHERE key='answers_revealed'").fetchone()['value']=='1'
             qid=int(c.execute("SELECT value FROM settings WHERE key='current_question'").fetchone()['value'] or 0)
             if qid:
                 freeze_question_timer(c,qid)
                 finalize_question(c,qid)
             c.execute("UPDATE settings SET value='1' WHERE key='answers_revealed'")
+            if qid and not was_revealed: emit_sound_event(c,'answer_reveal')
         elif a=='set_public_url': c.execute("UPDATE settings SET value=? WHERE key='public_url'",(str(d.get('url','')).strip().rstrip('/').removesuffix('/join').removesuffix('/admin'),))
         elif a=='set_screen':
             if d['mode']!='question': stop_media_control(c)
@@ -593,6 +896,47 @@ async def action(p:Payload,x_admin_key:str|None=Header(default=None)):
             show_screen_media(c,d)
         elif a=='hide_screen_media':
             hide_screen_media(c)
+        elif a=='round_media_step':
+            target=get_screen_media(c)
+            value=step_round_media(c,int(d.get('direction') or 1))
+            if target and target.get('round_type')=='karaoke':
+                kstate=get_karaoke_state(c); index=int(value.get('index') if value else 0)
+                write_json_setting(c,'karaoke_state',{'round_id':int(target.get('round_id') or 0),'index':index,'status':'playing','singer_ids':kstate.get('singer_ids',[]),'results':[],'winner_names':[]})
+        elif a=='karaoke_set_singers':
+            rid=int(c.execute("SELECT value FROM settings WHERE key='active_round_id'").fetchone()['value'] or 0)
+            rr=c.execute('SELECT karaoke_singers FROM rounds WHERE id=? AND game_id=?',(rid,gid)).fetchone()
+            if not rr: raise HTTPException(409,'Караоке-раунд не активен')
+            needed=int(rr['karaoke_singers'] or 1); ids=[int(x) for x in d.get('participant_ids',[]) if str(x).isdigit()]
+            ids=list(dict.fromkeys(ids))
+            if len(ids)!=needed: raise HTTPException(400,f'Выберите ровно {needed} исполнителя(ей)')
+            for pid in ids:
+                if not c.execute('SELECT id FROM participants WHERE id=? AND game_id=?',(pid,gid)).fetchone(): raise HTTPException(400,'Один из исполнителей не найден среди участников')
+            ks=get_karaoke_state(c); ks.update({'round_id':rid,'singer_ids':ids})
+            if ks.get('status')=='waiting_singers':
+                ks.update({'status':'counting','started_at':time.time(),'results':[],'winner_names':[]})
+                emit_sound_event(c,'karaoke_counting')
+            write_json_setting(c,'karaoke_state',ks)
+        elif a=='karaoke_begin_score':
+            rid=int(c.execute("SELECT value FROM settings WHERE key='active_round_id'").fetchone()['value'] or 0)
+            ks=get_karaoke_state(c); rr=c.execute('SELECT karaoke_singers FROM rounds WHERE id=?',(rid,)).fetchone()
+            if not rr or len(ks.get('singer_ids',[]))!=int(rr['karaoke_singers'] or 1): raise HTTPException(400,'Сначала выберите исполнителей в пульте ведущего')
+            media=get_screen_media(c)
+            if not media: raise HTTPException(409,'Видео караоке сейчас не открыто')
+            control=get_media_control(c); now=time.time(); position=float(control.get('position') or 0)
+            if control.get('action')=='playing': position+=max(0,now-float(control.get('updated_at') or now))
+            write_media_control(c,{**control,'sequence':control['sequence']+1,'action':'paused','position':round(position,3),'updated_at':now})
+            ks.update({'round_id':rid,'index':int(media.get('index') or 0),'status':'counting','started_at':now,'results':[],'winner_names':[]})
+            write_json_setting(c,'karaoke_state',ks); emit_sound_event(c,'karaoke_counting')
+        elif a=='karaoke_next_track':
+            media=get_screen_media(c)
+            if not media or media.get('round_type')!='karaoke': raise HTTPException(409,'Караоке не активно')
+            items=media.get('items') or []; index=int(media.get('index') or 0)
+            if index+1<len(items):
+                item=items[index+1]; value=show_screen_media(c,{'url':item.get('url'),'name':item.get('name'),'items':items,'index':index+1,'round_id':media.get('round_id'),'round_type':'karaoke','karaoke_singers':media.get('karaoke_singers',1)})
+                ks=get_karaoke_state(c); ks.update({'round_id':int(media.get('round_id') or 0),'index':index+1,'status':'playing','results':[],'winner_names':[],'started_at':0})
+                write_json_setting(c,'karaoke_state',ks)
+            else:
+                complete_media_round(c,int(media.get('round_id') or 0))
         elif a in ('media_play','media_pause','media_restart','media_stop'):
             set_media_control(c,a)
         elif a=='start_game':
@@ -648,8 +992,25 @@ async def admin_media(x_admin_key:str|None=Header(default=None)):
         ext=path.suffix.lower()
         typ='audio' if ext in {'.mp3','.wav','.ogg','.m4a','.aac','.flac'} else 'video' if ext in {'.mp4','.webm','.mov','.m4v'} else 'image'
         url='/media/'+path.name
-        items.append({'name':path.name,'url':url,'type':typ,'size':path.stat().st_size,'references':refs.get(url,[])})
+        with db() as c:
+            meta=c.execute('SELECT display_name,original_name FROM media_metadata WHERE filename=?',(path.name,)).fetchone()
+        display=(meta['display_name'] if meta and meta['display_name'] else (meta['original_name'] if meta and meta['original_name'] else path.name))
+        items.append({'name':display,'filename':path.name,'original_name':meta['original_name'] if meta else path.name,'url':url,'type':typ,'size':path.stat().st_size,'references':refs.get(url,[])})
     return items
+
+@app.post('/api/admin/media/rename')
+async def rename_admin_media(p:dict,x_admin_key:str|None=Header(default=None)):
+    admin(x_admin_key)
+    filename=str(p.get('filename') or '')
+    display=str(p.get('display_name') or '').strip()[:240]
+    if Path(filename).name!=filename or filename in ('','.','..'): raise HTTPException(400,'Некорректное имя файла')
+    if not display: raise HTTPException(400,'Введите название файла')
+    if not (MEDIA/filename).is_file(): raise HTTPException(404,'Файл не найден')
+    with db() as c:
+        row=c.execute('SELECT original_name FROM media_metadata WHERE filename=?',(filename,)).fetchone()
+        original=row['original_name'] if row else filename
+        c.execute('INSERT OR REPLACE INTO media_metadata(filename,display_name,original_name) VALUES(?,?,?)',(filename,display,original))
+    return {'ok':True,'display_name':display}
 
 @app.delete('/api/admin/media/{name}')
 async def delete_admin_media(name:str,x_admin_key:str|None=Header(default=None)):
@@ -664,6 +1025,7 @@ async def delete_admin_media(name:str,x_admin_key:str|None=Header(default=None))
         used=c.execute('SELECT COUNT(*) n FROM questions WHERE media=?',(url,)).fetchone()['n']
         if used: raise HTTPException(409,'Сначала открепите файл от всех вопросов')
         target.unlink()
+        with db() as c: c.execute('DELETE FROM media_metadata WHERE filename=?',(name,))
     return {'ok':True}
 
 @app.post('/api/upload')
@@ -682,7 +1044,9 @@ async def upload(file:UploadFile=File(...),x_admin_key:str|None=Header(default=N
     except Exception:
         dest.unlink(missing_ok=True); raise
     typ='audio' if suffix in {'.mp3','.wav','.ogg','.m4a','.aac','.flac'} else 'video' if suffix in {'.mp4','.webm','.mov','.m4v'} else 'image'
-    return {'url':'/media/'+name,'type':typ,'filename':file.filename,'size':size}
+    original=Path(file.filename or name).name[:240]
+    with db() as c: c.execute('INSERT OR REPLACE INTO media_metadata(filename,display_name,original_name) VALUES(?,?,?)',(name,original,original))
+    return {'url':'/media/'+name,'type':typ,'filename':name,'display_name':original,'original_name':original,'size':size}
 
 @app.post('/api/register')
 async def register(p:dict):
@@ -720,7 +1084,37 @@ async def answer(p:Answer):
         if existing and existing['is_correct'] is not None: raise HTTPException(409,'Вы уже отвечали на этот вопрос. Повторная попытка не предусмотрена.')
         if existing: c.execute('UPDATE answers SET text=?,created_at=CURRENT_TIMESTAMP,is_correct=NULL,awarded_points=0 WHERE id=?',(p.text[:500],existing['id']))
         else: c.execute('INSERT INTO answers(participant_id,question_id,text) VALUES(?,?,?)',(p.participant_id,q['id'],p.text[:500]))
+        emit_sound_event(c,'answer_submit')
     await broadcast(); return {'ok':True}
+@app.post('/api/media-ended')
+async def media_ended(p:dict):
+    url=str(p.get('url') or '')
+    changed=False
+    with db() as c:
+        rid=int(c.execute("SELECT value FROM settings WHERE key='active_round_id'").fetchone()['value'] or 0)
+        rr=c.execute('SELECT * FROM rounds WHERE id=?',(rid,)).fetchone() if rid else None
+        media=get_screen_media(c)
+        if not rr or not media or media.get('url')!=url: return {'ok':True,'ignored':True}
+        if rr['round_type']=='karaoke':
+            ks=get_karaoke_state(c)
+            if ks.get('status') in ('counting','waiting_singers','result'): return {'ok':True,'ignored':True}
+            control=get_media_control(c); now=time.time()
+            duration=max(0,float(p.get('duration') or control.get('position') or 0))
+            write_media_control(c,{**control,'sequence':control['sequence']+1,'scope':'screen','question_id':0,'url':url,'type':'video','action':'paused','position':duration,'updated_at':now})
+            needed=int(rr['karaoke_singers'] or 1)
+            singers=ks.get('singer_ids',[])
+            ready=len(singers)==needed
+            ks.update({'round_id':rid,'index':int(media.get('index') or 0),'status':'counting' if ready else 'waiting_singers','started_at':now if ready else 0,'results':[],'winner_names':[]})
+            write_json_setting(c,'karaoke_state',ks)
+            if ready: emit_sound_event(c,'karaoke_counting')
+            changed=True
+        elif rr['round_type']=='gallery' and ((media.get('type')=='video' and int(media.get('auto_video_advance',1))>0) or (media.get('type')=='image' and int(media.get('auto_interval') or 0)>0)):
+            # Still images use the configured interval; videos have their own auto-advance toggle.
+            step_round_media(c,1,automatic=True); changed=True
+    if changed: await broadcast()
+    return {'ok':True}
+
+
 @app.get('/api/player/question-result')
 async def player_question_result(participant_id:int, question_id:int):
     s=state()
@@ -786,4 +1180,4 @@ async def connect_qr(request: Request):
 
 @app.on_event('startup')
 async def startup():
-    print('\n'+'='*58+'\n QUIZCONTROL 0.6.5\n Админка: http://127.0.0.1:8080/admin\n Экран: http://127.0.0.1:8080/display\n Участники: http://127.0.0.1:8080/join\n Пароль организатора: '+ADMIN_KEY+'\n'+'='*58+'\n')
+    print('\n'+'='*58+'\n QUIZCONTROL 0.7.0\n Админка: http://127.0.0.1:8080/admin\n Экран: http://127.0.0.1:8080/display\n Участники: http://127.0.0.1:8080/join\n Пароль организатора: '+ADMIN_KEY+'\n'+'='*58+'\n')
